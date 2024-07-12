@@ -20,6 +20,7 @@ from torchvision import transforms
 
 from tqdm import tqdm
 
+from torch.utils.data import random_split
 from torchvision.models import vit_b_16, ViT_B_16_Weights
 
 def set_seed(seed):
@@ -445,7 +446,13 @@ def main():
     # print('train_max_sequence:', train_dataset.max_sequence)
     # print('test_max_sequence:', test_dataset.max_sequence)
 
-    train_loader = torch.utils.data.DataLoader(train_dataset, batch_size=1, shuffle=True)
+    train_size_rate = 0.8
+    train_size = int(train_size_rate * len(train_dataset))
+    val_size = len(train_dataset) - train_size
+
+    train_dataset, val_dataset = random_split(train_dataset, [train_size, val_size])
+
+    train_loader = torch.utils.data.DataLoader(train_dataset, batch_size=256, shuffle=True)
     test_loader = torch.utils.data.DataLoader(test_dataset, batch_size=1, shuffle=False)
 
     # 追加

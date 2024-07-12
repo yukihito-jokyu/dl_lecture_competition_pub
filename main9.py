@@ -15,12 +15,15 @@ import pandas
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+import torch.nn.init as init
 import torchvision
 from torchvision import transforms
 
 from tqdm import tqdm
 
+from torch.utils.data import random_split
 from torchvision.models import vit_b_16, ViT_B_16_Weights
+import math
 
 def set_seed(seed):
     random.seed(seed)
@@ -339,6 +342,17 @@ class BilinearAttention(nn.Module):
         self.dropout = nn.Dropout(0.2)
         self.linear = nn.Linear(h_dim, h_out)
 
+        # Heの初期化
+        init.kaiming_uniform_(self.v_proj.weight, a=math.sqrt(5))
+        init.kaiming_uniform_(self.q_proj.weight, a=math.sqrt(5))
+        init.kaiming_uniform_(self.linear.weight, a=math.sqrt(5))
+        if self.v_proj.bias is not None:
+            init.zeros_(self.v_proj.bias)
+        if self.q_proj.bias is not None:
+            init.zeros_(self.q_proj.bias)
+        if self.linear.bias is not None:
+            init.zeros_(self.linear.bias)
+
     def forward(self, v, q):
         v_proj = self.v_proj(v)  # [batch_size, seq_len, h_dim]
         q_proj = self.q_proj(q)  # [batch_size, h_dim]
@@ -368,8 +382,6 @@ class VQAModel(nn.Module):
         self.embedding = nn.Embedding(vocab_size, embed_size)
         self.lstm1 = nn.LSTM(embed_size, hidden_size, batch_first=True)
         self.dropout1 = nn.Dropout(dropout_rate)
-        self.lstm2 = nn.LSTM(embed_size, hidden_size, batch_first=True)
-        self.dropout2 = nn.Dropout(dropout_rate)
 
         # self.text_encoder = nn.Linear(vocab_size, 512)
         self.ban = BilinearAttention(768, hidden_size, 1024, 1024)
@@ -380,6 +392,13 @@ class VQAModel(nn.Module):
             nn.Linear(512, n_answer)
         )
 
+        # He初期化
+        for m in self.modules():
+            if isinstance(m, nn.Linear):
+                init.kaiming_uniform_(m.weight, nonlinearity='relu')
+                if m.bias is not None:
+                    init.zeros_(m.bias)
+
     def forward(self, image, question):
         # image_feature = self.resnet(image)  # 画像の特徴量
         image_feature = self.vit(image)
@@ -389,8 +408,6 @@ class VQAModel(nn.Module):
         question = question.long()
         embedded = self.embedding(question)
         out, (question_feature, _) = self.lstm1(embedded)
-        out = self.dropout1(out)
-        out, (question_feature, _) = self.lstm2(out)
         question_feature = question_feature[-1]
 
         fused_feature = self.ban(image_feature, question_feature)
@@ -465,16 +482,23 @@ def main():
         transforms.Resize((224, 224)),
         transforms.ToTensor()
     ])
-    train_dataset = VQADataset(df_path="./data/train.json", image_dir="./data/train", transform=transform)
+    origin_dataset = VQADataset(df_path="./data/train.json", image_dir="./data/train", transform=transform)
     print('train_load')
-    print('vocab', len(train_dataset.question2idx)+1)
+    print('vocab', len(origin_dataset.question2idx)+1)
     test_dataset = VQADataset(df_path="./data/valid.json", image_dir="./data/valid", transform=transform, answer=False)
     print('test_load')
-    test_dataset.update_dict(train_dataset)
+    test_dataset.update_dict(origin_dataset)
     # print('train_max_sequence:', train_dataset.max_sequence)
     # print('test_max_sequence:', test_dataset.max_sequence)
 
+    train_size_rate = 0.8
+    train_size = int(train_size_rate * len(origin_dataset))
+    val_size = len(origin_dataset) - train_size
+
+    train_dataset, val_dataset = random_split(origin_dataset, [train_size, val_size])
+
     train_loader = torch.utils.data.DataLoader(train_dataset, batch_size=256, shuffle=True)
+    val_loader = torch.utils.data.DataLoader(val_dataset, batch_size=256, shuffle=False)
     test_loader = torch.utils.data.DataLoader(test_dataset, batch_size=1, shuffle=False)
 
     # 追加
@@ -482,21 +506,43 @@ def main():
     hidden_size = 512
     dropout_rate = 0.5
 
-    model = VQAModel(vocab_size=len(train_dataset.vocab2idx)+1, embed_size=embed_size, hidden_size=hidden_size, n_answer=len(train_dataset.vocab2idx), dropout_rate=dropout_rate).to(device)
+    model = VQAModel(vocab_size=len(origin_dataset.vocab2idx)+1, embed_size=embed_size, hidden_size=hidden_size, n_answer=len(origin_dataset.vocab2idx), dropout_rate=dropout_rate).to(device)
     print('model_load')
     # optimizer / criterion
     num_epoch = 20
     criterion = nn.CrossEntropyLoss()
     optimizer = torch.optim.AdamW(model.parameters(), lr=0.001, weight_decay=1e-5)
 
+    min_loss = 10
+    loss_down_count = 0
+
     # train model
     for epoch in range(num_epoch):
+        model.train()
         train_loss, train_acc, train_simple_acc, train_time = train(model, train_loader, optimizer, criterion, device)
         print(f"【{epoch + 1}/{num_epoch}】\n"
               f"train time: {train_time:.2f} [s]\n"
               f"train loss: {train_loss:.4f}\n"
               f"train acc: {train_acc:.4f}\n"
               f"train simple acc: {train_simple_acc:.4f}")
+        
+        model.eval()
+        eval_loss, eval_acc, eval_simple_acc, eval_time = eval(model, train_loader, optimizer, criterion, device)
+        print(f"【{epoch + 1}/{num_epoch}】\n"
+              f"eval time: {eval_time:.2f} [s]\n"
+              f"eval loss: {eval_loss:.4f}\n"
+              f"eval acc: {eval_acc:.4f}\n"
+              f"eval simple acc: {eval_simple_acc:.4f}")
+        if min_loss > eval_loss:
+            min_loss = eval_loss
+            loss_down_count = 0
+        else:
+            loss_down_count += 1
+        
+        if loss_down_count >= 3:
+            print('end')
+            print('epoch:', epoch+1)
+            break
 
     # 提出用ファイルの作成
     model.eval()
