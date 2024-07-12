@@ -71,18 +71,29 @@ class VQADataset(torch.utils.data.Dataset):
         self.answer = answer
 
         # question / answerの辞書を作成
+        self.vocab2idx = {}
+        self.idx2vocab = {}
         self.question2idx = {}
         self.answer2idx = {}
         self.idx2question = {}
         self.idx2answer = {}
+        self.max_sequence = 58
 
         # 質問文に含まれる単語を辞書に追加
         for question in self.df["question"]:
+            if question == "Hey, I actually have two questions.  One is, please tell me what my meat is.  Wow, that didn't sound right, just kidding OK?  I hope I didn't offend you.  Second question is, do you know how I add (totally unrelated)... how do I add a contact to either BizWiz or my contact list?  I'm trying to send...":
+                print(question)
+                print(len(process_text(question).split(" ")))
             question = process_text(question)
             words = question.split(" ")
+            self.max_sequence = max(self.max_sequence, len(words))
             for word in words:
                 if word not in self.question2idx:
                     self.question2idx[word] = len(self.question2idx)
+                # 追加
+                if word not in self.vocab2idx:
+                    self.vocab2idx[word] = len(self.vocab2idx)
+
         self.idx2question = {v: k for k, v in self.question2idx.items()}  # 逆変換用の辞書(question)
 
         if self.answer:
@@ -93,6 +104,13 @@ class VQADataset(torch.utils.data.Dataset):
                     word = process_text(word)
                     if word not in self.answer2idx:
                         self.answer2idx[word] = len(self.answer2idx)
+                    # 追加
+                    if word not in self.vocab2idx:
+                        self.vocab2idx[word] = len(self.vocab2idx)
+            
+            # 追加
+            self.idx2vocab = {v: k for k, v in self.vocab2idx.items()}
+
             self.idx2answer = {v: k for k, v in self.answer2idx.items()}  # 逆変換用の辞書(answer)
 
     def update_dict(self, dataset):
@@ -106,8 +124,10 @@ class VQADataset(torch.utils.data.Dataset):
         """
         self.question2idx = dataset.question2idx
         self.answer2idx = dataset.answer2idx
+        self.vocab2idx = dataset.vocab2idx
         self.idx2question = dataset.idx2question
         self.idx2answer = dataset.idx2answer
+        self.idx2vocab = dataset.idx2vocab
 
     def __getitem__(self, idx):
         """
@@ -129,20 +149,27 @@ class VQADataset(torch.utils.data.Dataset):
         mode_answer_idx : torch.Tensor  (1)
             10人の回答者の回答の中で最頻値の回答のid
         """
-        print(idx)
+        # print(idx)
+        # print(self.df["question"][idx])
         image = Image.open(f"{self.image_dir}/{self.df['image'][idx]}")
         image = self.transform(image)
-        question = np.zeros(len(self.idx2question) + 1)  # 未知語用の要素を追加
+        # question = np.zeros(len(self.idx2question) + 1)  # 未知語用の要素を追加
+        question = np.zeros(self.max_sequence) # 変更
         question_words = self.df["question"][idx].split(" ")
-        for word in question_words:
+        print(len(question_words))
+        print(self.df["question"][idx])
+        for index, word in enumerate(question_words):
             try:
-                question[self.question2idx[word]] = 1  # one-hot表現に変換
+                # question[self.question2idx[word]] = 1  # one-hot表現に変換
+                # question[index] = self.vocab2idx[process_text(word)] # 変更
+                question[index] = self.vocab2idx[word]
             except KeyError:
-                print(word)
+                # print(word)
                 question[-1] += 1  # 未知語
 
         if self.answer:
-            answers = [self.answer2idx[process_text(answer["answer"])] for answer in self.df["answers"][idx]]
+            # answers = [self.answer2idx[process_text(answer["answer"])] for answer in self.df["answers"][idx]]
+            answers = [self.vocab2idx[process_text(answer["answer"])] for answer in self.df["answers"][idx]]
             mode_answer_idx = mode(answers)  # 最頻値を取得（正解ラベル）
 
             return image, torch.Tensor(question), torch.Tensor(answers), int(mode_answer_idx)
@@ -291,12 +318,15 @@ def ResNet50():
 
 
 class VQAModel(nn.Module):
-    def __init__(self, vocab_size: int, embed_size: int, hidden_size: int, n_answer: int):
+    def __init__(self, vocab_size: int, embed_size: int, hidden_size: int, dropout_rate: float, n_answer: int):
         super().__init__()
         self.resnet = ResNet18()
         # 追加
         self.embedding = nn.Embedding(vocab_size, embed_size)
-        self.lstm = nn.LSTM(embed_size, hidden_size, batch_first=True)
+        self.lstm1 = nn.LSTM(embed_size, hidden_size, batch_first=True)
+        self.dropout1 = nn.Dropout(dropout_rate)
+        self.lstm2 = nn.LSTM(embed_size, hidden_size, batch_first=True)
+        self.dropout2 = nn.Dropout(dropout_rate)
 
         self.text_encoder = nn.Linear(vocab_size, 512)
 
@@ -313,11 +343,19 @@ class VQAModel(nn.Module):
         # 追加
         question = question.long()
         embedded = self.embedding(question)
-        _, (question_feature, _) = self.lstm(embedded)
+        out, (question_feature, _) = self.lstm1(embedded)
+        out, (question_feature, _) = self.lstm2(out)
         question_feature = question_feature[-1]
 
         x = torch.cat([image_feature, question_feature], dim=1)
         x = self.fc(x)
+
+        # 表示
+        # print('question:', question, question.size())
+        # print('embedded:', embedded, embedded.size())
+        # print('out', out, out.size())
+        # print('question_feature:', question_feature, question_feature.size())
+        # print('x:', x, x.size())
 
         return x
 
@@ -332,10 +370,10 @@ def train(model, dataloader, optimizer, criterion, device):
 
     start = time.time()
     for image, question, answers, mode_answer in tqdm(dataloader):
-        print('question:', question)
-        print('answers:', answers, answers.size())
-        print('mode_answer.squeeze():', mode_answer.squeeze(), mode_answer.squeeze().size())
-        print('mode_answer:', mode_answer, mode_answer.size())
+        # print('question:', question)
+        # print('answers:', answers, answers.size())
+        # print('mode_answer.squeeze():', mode_answer.squeeze(), mode_answer.squeeze().size())
+        # print('mode_answer:', mode_answer, mode_answer.size())
         image, question, answer, mode_answer = \
             image.to(device), question.to(device), answers.to(device), mode_answer.to(device)
 
@@ -349,6 +387,7 @@ def train(model, dataloader, optimizer, criterion, device):
         total_loss += loss.item()
         total_acc += VQA_criterion(pred.argmax(1), answers)  # VQA accuracy
         simple_acc += (pred.argmax(1) == mode_answer).float().mean().item()  # simple accuracy
+        # pass
 
     return total_loss / len(dataloader), total_acc / len(dataloader), simple_acc / len(dataloader), time.time() - start
 
@@ -387,18 +426,22 @@ def main():
     ])
     train_dataset = VQADataset(df_path="./data/train.json", image_dir="./data/train", transform=transform)
     print('train_load')
+    print('vocab', len(train_dataset.question2idx)+1)
     test_dataset = VQADataset(df_path="./data/valid.json", image_dir="./data/valid", transform=transform, answer=False)
     print('test_load')
     test_dataset.update_dict(train_dataset)
+    # print('train_max_sequence:', train_dataset.max_sequence)
+    # print('test_max_sequence:', test_dataset.max_sequence)
 
     train_loader = torch.utils.data.DataLoader(train_dataset, batch_size=128, shuffle=True)
     test_loader = torch.utils.data.DataLoader(test_dataset, batch_size=1, shuffle=False)
 
     # 追加
-    embed_size = 256
-    hidden_size = 256
+    embed_size = 128
+    hidden_size = 128
+    dropout_rate = 0.5
 
-    model = VQAModel(vocab_size=len(train_dataset.question2idx)+1, embed_size=embed_size, hidden_size=hidden_size, n_answer=len(train_dataset.answer2idx)).to(device)
+    model = VQAModel(vocab_size=len(train_dataset.vocab2idx)+1, embed_size=embed_size, hidden_size=hidden_size, dropout_rate=dropout_rate, n_answer=len(train_dataset.vocab2idx)).to(device)
     print('model_load')
     # optimizer / criterion
     num_epoch = 20
