@@ -176,6 +176,8 @@ class VQADataset(torch.utils.data.Dataset):
         # 追加
         sentence = ' '.join(question_words)
         for index, word in enumerate(question_words):
+            # if index == 20:
+            #     break
             try:
                 # question[self.question2idx[word]] = 1  # one-hot表現に変換
                 # question[index] = self.vocab2idx[process_text(word)] # 変更
@@ -335,65 +337,14 @@ def ResNet18():
 def ResNet50():
     return ResNet(BottleneckBlock, [3, 4, 6, 3])
 
-
-class BilinearAttention(nn.Module):
-    def __init__(self, v_dim, q_dim, h_dim, h_out):
-        super(BilinearAttention, self).__init__()
-        self.v_proj = nn.Linear(v_dim, h_dim)
-        self.q_proj = nn.Linear(q_dim, h_dim)
-        self.dropout = nn.Dropout(0.2)
-        self.linear = nn.Linear(h_dim, h_out)
-
-        # Heの初期化
-        init.kaiming_uniform_(self.v_proj.weight, a=math.sqrt(5))
-        init.kaiming_uniform_(self.q_proj.weight, a=math.sqrt(5))
-        init.kaiming_uniform_(self.linear.weight, a=math.sqrt(5))
-        if self.v_proj.bias is not None:
-            init.zeros_(self.v_proj.bias)
-        if self.q_proj.bias is not None:
-            init.zeros_(self.q_proj.bias)
-        if self.linear.bias is not None:
-            init.zeros_(self.linear.bias)
-
-    def forward(self, v, q):
-        v_proj = self.v_proj(v)  # [batch_size, seq_len, h_dim]
-        q_proj = self.q_proj(q)  # [batch_size, h_dim]
-        
-        # q_projを拡張して v_proj と同じ次元数にする
-        q_proj = q_proj.unsqueeze(1)  # [batch_size, 1, h_dim]
-        
-        att = torch.bmm(v_proj, q_proj.transpose(1, 2))  # [batch_size, seq_len, 1]
-        att = F.softmax(att, dim=1)
-        
-        v_attended = torch.bmm(att.transpose(1, 2), v)  # [batch_size, 1, v_dim]
-        v_attended = v_attended.squeeze(1)  # [batch_size, v_dim]
-        
-        out = self.dropout(v_attended * q)
-        return self.linear(out)
-
-
 class VQAModel(nn.Module):
     def __init__(self, vocab_size: int, embed_size: int, hidden_size: int, n_answer: int, dropout_rate: float):
         super().__init__()
         self.resnet = ResNet18()
-        # ResNetをViTに置き換え
-#         self.vit = vit_b_16(weights=ViT_B_16_Weights.DEFAULT)
-        # 最後の分類層を削除
-#         self.vit.heads = nn.Identity()
-        # 追加
         self.embedding = nn.Embedding(vocab_size, embed_size)
-        self.lstm1 = nn.LSTM(embed_size, hidden_size, batch_first=True)
-        self.dropout1 = nn.Dropout(dropout_rate)
+        self.lstm = nn.LSTM(embed_size, hidden_size, batch_first=True)
 
-        # self.text_encoder = nn.Linear(vocab_size, 512)
-#         self.ban = BilinearAttention(512, hidden_size, 1024, 1024)
-
-        self.fc = nn.Sequential(
-            nn.Linear(512+embed_size, 512),
-            nn.ReLU(inplace=True),
-            nn.Dropout(dropout_rate),
-            nn.Linear(512, n_answer)
-        )
+        self.fc = nn.Linear(512+embed_size, n_answer)
 
         # He初期化
         for m in self.modules():
@@ -403,22 +354,16 @@ class VQAModel(nn.Module):
                     init.zeros_(m.bias)
 
     def forward(self, image, question):
-        # image_feature = self.resnet(image)  # 画像の特徴量
         _, image_feature = self.resnet(image)
-        # question_feature = self.text_encoder(question)  # テキストの特徴量
 
         # 追加
         question = question.long()
         embedded = self.embedding(question)
-        out, (question_feature, _) = self.lstm1(embedded)
-        question_feature = self.dropout1(question_feature)
+        _, (question_feature, _) = self.lstm(embedded)
         question_feature = question_feature[-1]
-
-#         fused_feature = self.ban(image_feature, question_feature)
 
         x = torch.cat([image_feature, question_feature], dim=1)
         x = self.fc(x)
-        # x = self.fc(x)
         return x
 
 
@@ -513,7 +458,7 @@ def main():
     model = VQAModel(vocab_size=len(origin_dataset.vocab2idx)+1, embed_size=embed_size, hidden_size=hidden_size, n_answer=len(origin_dataset.vocab2idx), dropout_rate=dropout_rate).to(device)
     print('model_load')
     # optimizer / criterion
-    num_epoch = 30
+    num_epoch = 10
     criterion = nn.CrossEntropyLoss()
     optimizer = torch.optim.AdamW(model.parameters(), lr=0.001, weight_decay=1e-5)
 
@@ -546,9 +491,9 @@ def main():
 
         submission = [origin_dataset.idx2vocab[id] for id in submission]
         submission = np.array(submission)
-        torch.save(model.state_dict(), "model.pth")
-        np.save(f"{epoch}-{eval_acc}-submission8_new.npy", submission)
-        print(f'{epoch}-{eval_acc}-submission8_new.npy 作成！')
+        # torch.save(model.state_dict(), "model.pth")
+        np.save(f"main8/{epoch}-{eval_acc}-submission8.npy", submission)
+        print(f'main8/{epoch}-{eval_acc}-submission8.npy 作成！')
     
     # 提出用ファイルの作成
     model.eval()
@@ -562,7 +507,7 @@ def main():
     submission = [origin_dataset.idx2vocab[id] for id in submission]
     submission = np.array(submission)
     torch.save(model.state_dict(), "model.pth")
-    np.save(f"{epoch}-end-submission8_new.npy", submission)
+    np.save(f"main8/{epoch}-end-submission.npy", submission)
 
 if __name__ == "__main__":
     main()
